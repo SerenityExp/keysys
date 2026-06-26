@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: fury-tiers
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: GUILD_ID
+        sync: false
