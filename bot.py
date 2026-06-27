@@ -627,6 +627,64 @@ bot = TierBot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 
+async def auto_backfill_from_results(limit: int = 2000):
+    """Rebuild player tiers from the #results channel.
+
+    Render's free plan wipes the disk on restart, so data.json (and the saved
+    tiers) is lost every time the service restarts. The results channel is a
+    permanent record though, so on startup we replay it to restore every tier
+    automatically. No database or paid disk needed.
+    """
+    # Only worth doing if we actually lost the tier data.
+    if state.get("players"):
+        print(f"Tier data present ({len(state['players'])} players) - skipping auto-backfill.")
+        return
+    if not GUILD_ID:
+        print("Auto-backfill skipped: GUILD_ID not set.")
+        return
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        print("Auto-backfill skipped: bot can't see the guild yet.")
+        return
+    results_channel = guild.get_channel(RESULTS_CHANNEL_ID)
+    if results_channel is None:
+        print("Auto-backfill skipped: results channel not found.")
+        return
+
+    print("No saved tiers found - auto-backfilling from #results ...")
+    state.setdefault("players", {})
+    seen = set()
+    added = 0
+    try:
+        async for message in results_channel.history(limit=limit):
+            for embed in message.embeds:
+                parsed = parse_result_embed(embed)
+                if parsed is None:
+                    continue
+                mc, tier = parsed
+                if mc.lower() in seen:
+                    continue
+                uuid, canonical = await resolve_mojang(mc)
+                dedupe_key = uuid if uuid else "name:" + canonical.lower()
+                if dedupe_key in seen:
+                    seen.add(mc.lower())
+                    continue
+                seen.add(dedupe_key)
+                seen.add(mc.lower())
+                seen.add(canonical.lower())
+                _store_player(uuid, canonical, tier, REGION)
+                added += 1
+                await asyncio.sleep(0.12)
+    except discord.Forbidden:
+        print("Auto-backfill failed: missing permission to read results history.")
+        return
+    except Exception as e:
+        print(f"Auto-backfill error: {e}")
+        return
+    save_state()
+    print(f"Auto-backfill complete: restored {added} players from #results.")
+
+
 @bot.event
 async def on_ready():
     try:
@@ -635,6 +693,11 @@ async def on_ready():
         pass
     print(f"Logged in as {bot.user} ({bot.user.id})")
     print(f"Test cooldown: {TEST_COOLDOWN // 3600}h after a test | Command sync: {'guild (instant)' if GUILD_ID else 'global (slow)'}")
+    # Restore tiers if the disk was wiped (Render free tier resets on restart).
+    try:
+        await auto_backfill_from_results()
+    except Exception as e:
+        print(f"Auto-backfill outer error: {e}")
 
 
 def guild_only(interaction: discord.Interaction) -> bool:
