@@ -41,6 +41,7 @@ import re
 import time
 import json
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 from aiohttp import web
@@ -65,9 +66,22 @@ TOKEN = os.environ.get("BOT_TOKEN") or ""
 GUILD_ID = int(os.environ.get("GUILD_ID", "0"))
 
 TIER_TESTER_ROLE_ID = 1518428437419786324
+OWNER_ROLE_ID       = 1518428437419786328   # only this role can use admin commands
 REQUEST_CHANNEL_ID  = 1518428441542922263   # 🎫•request-test
 TICKET_CATEGORY_ID  = 1518428441542922262   # category for test channels
 RESULTS_CHANNEL_ID  = 1518428441089933364   # 🏆•results
+PUNISHMENT_CHANNEL_ID = 1518428440649269407 # ⛔•punishment
+
+# Restriction types -> the role to apply and how long it lasts.
+# Discord caps native timeouts at 28 days, so anything longer (e.g. Alting's
+# 30 days) keeps the role for the full time but the timeout itself is capped.
+RESTRICTIONS = {
+    "Cheating": {"role_id": 1518758986143502336, "days": 7,  "emoji": "🚫"},
+    "Alting":   {"role_id": 1518759322199392459, "days": 30, "emoji": "👥"},
+    "Threats":  {"role_id": 1518759250975789126, "days": 14, "emoji": "⚠️"},
+    "Toxicity": {"role_id": 1518759156423725235, "days": 7,  "emoji": "🤬"},
+}
+DISCORD_MAX_TIMEOUT_DAYS = 28
 
 REGION      = "NA"
 DEFAULT_KIT = "Crystal"
@@ -140,6 +154,9 @@ def get_guild_state(guild_id):
     g.setdefault("last_test", None)         # unix timestamp
     g.setdefault("tickets", {})             # {channel_id: {player_id, mc, server, kind, provisional}}
     g.setdefault("cooldowns", {})           # {user_id: unix timestamp of last completed test}
+    g.setdefault("user_accounts", {})       # {user_id: [mc uuids they've been tested on]}
+    g.setdefault("offenses", {})            # {user_id: {reason: count}}
+    g.setdefault("active_restrictions", []) # [{user_id, role_id, until, reason}]
     return g
 
 
@@ -154,6 +171,166 @@ def member_is_tester(member) -> bool:
     if perms is not None and perms.administrator:
         return True
     return any(r.id == TIER_TESTER_ROLE_ID for r in getattr(member, "roles", []))
+
+
+def member_is_owner(member) -> bool:
+    # Only members with the owner role may use the admin commands
+    # (resetcooldown, settier, removetier, backfill).
+    if member is None:
+        return False
+    return any(r.id == OWNER_ROLE_ID for r in getattr(member, "roles", []))
+
+
+def ordinal(n: int) -> str:
+    # 1 -> "1st", 2 -> "2nd", 3 -> "3rd", 4 -> "4th", ...
+    if 10 <= (n % 100) <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def build_restriction_embed(member_mention, reason, mc_username, mc_uuid,
+                            days, offense_num, moderator=None, auto=False):
+    info = RESTRICTIONS.get(reason, {})
+    emoji = info.get("emoji", "⛔")
+    capped = min(days, DISCORD_MAX_TIMEOUT_DAYS)
+
+    embed = discord.Embed(
+        title=f"{emoji} Player Restricted — {reason}",
+        color=0xED4245,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Member", value=member_mention, inline=True)
+    embed.add_field(name="Offense", value=f"**{ordinal(offense_num)} Offense**", inline=True)
+    embed.add_field(name="Duration", value=f"**{days} Days**", inline=True)
+
+    mc_line = f"`{mc_username}`" if mc_username and mc_username != "Unknown" else "*unknown*"
+    if mc_uuid:
+        mc_line += f"\n`{mc_uuid}`"
+    embed.add_field(name="Minecraft Account", value=mc_line, inline=False)
+
+    if auto:
+        embed.add_field(
+            name="Detection",
+            value="Automatically flagged — tested on a different Minecraft account.",
+            inline=False,
+        )
+    if moderator is not None:
+        embed.set_footer(text=f"Restricted by {moderator.display_name}")
+    if days > capped:
+        embed.add_field(
+            name="Note",
+            value=f"Discord timeouts max out at {capped} days; the role stays for the full {days}.",
+            inline=False,
+        )
+    return embed
+
+
+async def apply_restriction(guild, member, reason, mc_username=None, mc_uuid=None,
+                            moderator=None, auto=False):
+    """Time the member out, give them the restriction role, announce it, and
+    track the restriction so the role can be removed when it expires.
+    Returns (ok: bool, detail: str)."""
+    info = RESTRICTIONS.get(reason)
+    if info is None:
+        return False, f"Unknown restriction reason: {reason}"
+
+    gs = get_guild_state(guild.id)
+    uid = str(member.id)
+
+    # Offense count for this reason.
+    user_off = gs["offenses"].setdefault(uid, {})
+    user_off[reason] = int(user_off.get(reason, 0)) + 1
+    offense_num = user_off[reason]
+
+    days = info["days"]
+    role_id = info["role_id"]
+    capped_days = min(days, DISCORD_MAX_TIMEOUT_DAYS)
+    until_real = int(time.time()) + days * 86400
+
+    # 1) Timeout (capped at Discord's 28-day max).
+    timeout_failed = False
+    try:
+        until_dt = datetime.now(timezone.utc) + timedelta(days=capped_days)
+        await member.timeout(until_dt, reason=f"{reason} restriction")
+    except discord.Forbidden:
+        timeout_failed = True
+    except discord.HTTPException:
+        timeout_failed = True
+
+    # 2) Restriction role.
+    role_failed = False
+    role = guild.get_role(role_id)
+    if role is not None:
+        try:
+            await member.add_roles(role, reason=f"{reason} restriction")
+        except discord.HTTPException:
+            role_failed = True
+    else:
+        role_failed = True
+
+    # 3) Track for automatic removal when it expires.
+    gs["active_restrictions"].append({
+        "user_id": member.id,
+        "role_id": role_id,
+        "until": until_real,
+        "reason": reason,
+    })
+    save_state()
+
+    # 4) Announce in the punishment channel.
+    channel = guild.get_channel(PUNISHMENT_CHANNEL_ID)
+    if channel is not None:
+        embed = build_restriction_embed(
+            member.mention, reason, mc_username, mc_uuid, days, offense_num,
+            moderator=moderator, auto=auto,
+        )
+        try:
+            await channel.send(content="@here", embed=embed,
+                               allowed_mentions=discord.AllowedMentions(everyone=True, users=True))
+        except discord.HTTPException:
+            pass
+
+    notes = []
+    if timeout_failed:
+        notes.append("couldn't time them out (check my permissions/role order)")
+    if role_failed:
+        notes.append("couldn't add the restriction role (missing role or permissions)")
+    detail = "; ".join(notes) if notes else "applied"
+    return (not timeout_failed and not role_failed), detail
+
+
+async def remove_expired_restrictions():
+    """Background sweep: lift restriction roles whose time has passed."""
+    now = int(time.time())
+    for gid, g in list(state.get("guilds", {}).items()):
+        active = g.get("active_restrictions", [])
+        if not active:
+            continue
+        guild = bot.get_guild(int(gid))
+        still = []
+        for rec in active:
+            if rec.get("until", 0) > now:
+                still.append(rec)
+                continue
+            # Expired -> remove the role if we can.
+            if guild is not None:
+                role = guild.get_role(rec.get("role_id"))
+                member = guild.get_member(rec.get("user_id"))
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(rec.get("user_id"))
+                    except discord.HTTPException:
+                        member = None
+                if role is not None and member is not None:
+                    try:
+                        await member.remove_roles(role, reason="Restriction expired")
+                    except discord.HTTPException:
+                        pass
+        if len(still) != len(active):
+            g["active_restrictions"] = still
+            save_state()
 
 
 def cooldown_remaining(gs, user_id):
@@ -434,14 +611,28 @@ class JoinModal(discord.ui.Modal, title="Join the Test Queue"):
         required=True,
         max_length=16,
     )
+    mc_confirm = discord.ui.TextInput(
+        label="Reconfirm Username",
+        placeholder="Type your username again, exactly",
+        required=True,
+        max_length=16,
+    )
     server = discord.ui.TextInput(
         label="Preferred Server",
-        placeholder="e.g. NA East",
+        placeholder="e.g. PVPclub",
         required=True,
         max_length=40,
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Both username fields must match exactly (case-insensitive).
+        if str(self.mc).strip().lower() != str(self.mc_confirm).strip().lower():
+            await interaction.response.send_message(
+                "❌ The two usernames didn't match. Please open the queue and try again, "
+                "typing your Minecraft username the same way both times.",
+                ephemeral=True,
+            )
+            return
         gs = get_guild_state(interaction.guild_id)
         if not gs.get("queue_message_id"):
             await interaction.response.send_message("There's no open queue right now.", ephemeral=True)
@@ -534,33 +725,58 @@ class CloseModal(discord.ui.Modal, title="Submit Test Result"):
         gs["tickets"].pop(str(interaction.channel.id), None)
         save_state()
 
-        role_note = ""
-        if ticket and ticket.get("player_id") is not None:
-            target_member = interaction.guild.get_member(ticket["player_id"])
+        player_id = ticket["player_id"] if ticket and ticket.get("player_id") is not None else None
+        target_member = None
+        if player_id is not None:
+            target_member = interaction.guild.get_member(player_id)
             if target_member is None:
                 try:
-                    target_member = await interaction.guild.fetch_member(ticket["player_id"])
+                    target_member = await interaction.guild.fetch_member(player_id)
                 except discord.HTTPException:
                     target_member = None
-            if target_member is not None:
-                role, status = await assign_tier_role(interaction.guild, target_member, str(self.earned))
-                if status == "ok":
-                    role_note = f" {role.mention} role given."
-                elif status == "no_role":
-                    role_note = f" (No role named **{normalize_rank_code(str(self.earned))}** found — assign it manually.)"
-                elif status == "forbidden":
-                    role_note = " (Couldn't assign the role — check my permissions and that my role is above the tier roles.)"
-                else:
-                    role_note = " (Role assignment failed.)"
 
+        role_note = ""
+        if target_member is not None:
+            role, status = await assign_tier_role(interaction.guild, target_member, str(self.earned))
+            if status == "ok":
+                role_note = f" {role.mention} role given."
+            elif status == "no_role":
+                role_note = f" (No role named **{normalize_rank_code(str(self.earned))}** found — assign it manually.)"
+            elif status == "forbidden":
+                role_note = " (Couldn't assign the role — check my permissions and that my role is above the tier roles.)"
+            else:
+                role_note = " (Role assignment failed.)"
+
+        # Record the tier (and grab the resolved UUID for alting detection).
+        mc_uuid = None
         if mc and mc != "Unknown":
             try:
-                await record_player_tier(mc, str(self.earned), REGION)
+                rec = await record_player_tier(mc, str(self.earned), REGION)
+                mc_uuid = (rec or {}).get("uuid")
             except Exception:
-                pass
+                rec = None
+
+        # --- Alting detection -------------------------------------------------
+        # If this Discord user has previously been tested on a DIFFERENT
+        # Minecraft account, auto-restrict them for alting.
+        alt_note = ""
+        if player_id is not None and mc_uuid:
+            accounts = gs["user_accounts"].setdefault(str(player_id), [])
+            prior_other = [u for u in accounts if u and u != mc_uuid]
+            if prior_other and target_member is not None:
+                ok, detail = await apply_restriction(
+                    interaction.guild, target_member, "Alting",
+                    mc_username=mc, mc_uuid=mc_uuid, auto=True,
+                )
+                alt_note = (" ⚠️ This user was tested on a different account before — "
+                            "auto-restricted for **Alting** (30 days).")
+            if mc_uuid not in accounts:
+                accounts.append(mc_uuid)
+            save_state()
+        # ----------------------------------------------------------------------
 
         await interaction.response.send_message(
-            f"✅ Result submitted: **{expand_tier(str(self.earned))}**.{role_note} "
+            f"✅ Result submitted: **{expand_tier(str(self.earned))}**.{role_note}{alt_note} "
             f"Closing this channel in {CLOSE_DELAY} seconds…"
         )
         await asyncio.sleep(CLOSE_DELAY)
@@ -698,6 +914,24 @@ async def on_ready():
         await auto_backfill_from_results()
     except Exception as e:
         print(f"Auto-backfill outer error: {e}")
+    # Start the background sweep that lifts expired restriction roles.
+    global _restriction_sweeper_started
+    if not _restriction_sweeper_started:
+        _restriction_sweeper_started = True
+        bot.loop.create_task(restriction_sweeper_loop())
+
+
+_restriction_sweeper_started = False
+
+
+async def restriction_sweeper_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await remove_expired_restrictions()
+        except Exception as e:
+            print(f"Restriction sweeper error: {e}")
+        await asyncio.sleep(600)  # check every 10 minutes
 
 
 def guild_only(interaction: discord.Interaction) -> bool:
@@ -987,8 +1221,8 @@ async def resetcooldown_cmd(interaction: discord.Interaction, user: discord.Memb
     if not guild_only(interaction):
         await interaction.response.send_message("Use this in the server.", ephemeral=True)
         return
-    if not member_is_tester(interaction.user):
-        await interaction.response.send_message("You need the **[TierTester]** role to use this.", ephemeral=True)
+    if not member_is_owner(interaction.user):
+        await interaction.response.send_message("Only the **owner** role can use this.", ephemeral=True)
         return
     gs = get_guild_state(interaction.guild_id)
     had = gs["cooldowns"].pop(str(user.id), None)
@@ -1011,8 +1245,8 @@ async def settier_cmd(interaction: discord.Interaction, username: str, tier: str
     if not guild_only(interaction):
         await interaction.response.send_message("Use this in the server.", ephemeral=True)
         return
-    if not member_is_tester(interaction.user):
-        await interaction.response.send_message("You need the **[TierTester]** role to use this.", ephemeral=True)
+    if not member_is_owner(interaction.user):
+        await interaction.response.send_message("Only the **owner** role can use this.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     rec = await record_player_tier(username, tier, REGION)
@@ -1030,8 +1264,8 @@ async def backfill_cmd(interaction: discord.Interaction, limit: int = 1000):
     if not guild_only(interaction):
         await interaction.response.send_message("Use this in the server.", ephemeral=True)
         return
-    if not member_is_tester(interaction.user):
-        await interaction.response.send_message("You need the **[TierTester]** role to use this.", ephemeral=True)
+    if not member_is_owner(interaction.user):
+        await interaction.response.send_message("Only the **owner** role can use this.", ephemeral=True)
         return
 
     results_channel = interaction.guild.get_channel(RESULTS_CHANNEL_ID)
@@ -1089,8 +1323,8 @@ async def removetier_cmd(interaction: discord.Interaction, username: str):
     if not guild_only(interaction):
         await interaction.response.send_message("Use this in the server.", ephemeral=True)
         return
-    if not member_is_tester(interaction.user):
-        await interaction.response.send_message("You need the **[TierTester]** role to use this.", ephemeral=True)
+    if not member_is_owner(interaction.user):
+        await interaction.response.send_message("Only the **owner** role can use this.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
 
@@ -1115,6 +1349,61 @@ async def removetier_cmd(interaction: discord.Interaction, username: str):
         await interaction.followup.send(f"✅ Removed **{canonical or username}**'s tier from the API.", ephemeral=True)
     else:
         await interaction.followup.send(f"No tier found for **{username}**.", ephemeral=True)
+
+
+@tree.command(name="restrict", description="Restrict a member (owner only): times them out, gives the role, posts to punishments.")
+@app_commands.default_permissions()
+@app_commands.describe(
+    user="The member to restrict.",
+    reason="What they're being restricted for.",
+    minecraft="Their Minecraft username (optional, shown in the announcement).",
+)
+@app_commands.choices(reason=[
+    app_commands.Choice(name="Cheating (7 days)", value="Cheating"),
+    app_commands.Choice(name="Alting (30 days)", value="Alting"),
+    app_commands.Choice(name="Threats (14 days)", value="Threats"),
+    app_commands.Choice(name="Toxicity (7 days)", value="Toxicity"),
+])
+async def restrict_cmd(interaction: discord.Interaction, user: discord.Member,
+                       reason: app_commands.Choice[str], minecraft: str = None):
+    if not guild_only(interaction):
+        await interaction.response.send_message("Use this in the server.", ephemeral=True)
+        return
+    if not member_is_owner(interaction.user):
+        await interaction.response.send_message("Only the **owner** role can use this.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    reason_value = reason.value
+    info = RESTRICTIONS.get(reason_value, {})
+
+    # Try to resolve a UUID for the announcement if a username was given.
+    mc_uuid = None
+    mc_name = minecraft
+    if minecraft:
+        uuid, canonical = await resolve_mojang(minecraft)
+        mc_uuid = uuid
+        mc_name = canonical or minecraft
+
+    ok, detail = await apply_restriction(
+        interaction.guild, user, reason_value,
+        mc_username=mc_name, mc_uuid=mc_uuid, moderator=interaction.user, auto=False,
+    )
+
+    days = info.get("days", "?")
+    if ok:
+        await interaction.followup.send(
+            f"✅ Restricted {user.mention} for **{reason_value}** ({days} days). "
+            f"Role applied, timed out, and posted to the punishment channel.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(
+            f"⚠️ Restriction for {user.mention} (**{reason_value}**) was recorded and announced, "
+            f"but: {detail}. Check my role order and that I have Moderate Members + Manage Roles.",
+            ephemeral=True,
+        )
 
 
 # --------------------------------- Run -----------------------------------
