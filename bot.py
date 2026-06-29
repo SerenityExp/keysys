@@ -76,10 +76,14 @@ PUNISHMENT_CHANNEL_ID = 1518428440649269407 # ⛔•punishment
 # Discord caps native timeouts at 28 days, so anything longer (e.g. Alting's
 # 30 days) keeps the role for the full time but the timeout itself is capped.
 RESTRICTIONS = {
-    "Cheating": {"role_id": 1518758986143502336, "days": 7,  "emoji": "🚫"},
-    "Alting":   {"role_id": 1518759322199392459, "days": 30, "emoji": "👥"},
-    "Threats":  {"role_id": 1518759250975789126, "days": 14, "emoji": "⚠️"},
-    "Toxicity": {"role_id": 1518759156423725235, "days": 7,  "emoji": "🤬"},
+    "Cheating": {"role_id": 1518758986143502336, "days": 7,  "emoji": "🚫",
+                 "phrase": "Cheating"},
+    "Alting":   {"role_id": 1518759322199392459, "days": 30, "emoji": "👥",
+                 "phrase": "Alting the Tierlist and Bypassing Testing Cooldown"},
+    "Threats":  {"role_id": 1518759250975789126, "days": 14, "emoji": "⚠️",
+                 "phrase": "Making Threats"},
+    "Toxicity": {"role_id": 1518759156423725235, "days": 7,  "emoji": "🤬",
+                 "phrase": "Toxicity"},
 }
 DISCORD_MAX_TIMEOUT_DAYS = 28
 
@@ -190,47 +194,86 @@ def ordinal(n: int) -> str:
     return f"{n}{suffix}"
 
 
-def build_restriction_embed(member_mention, reason, mc_username, mc_uuid,
-                            days, offense_num, moderator=None, auto=False):
+def uuid_to_name(uuid):
+    # Best-effort: find the username we have on record for a UUID.
+    if not uuid:
+        return None
+    rec = state.get("players", {}).get(uuid)
+    if rec and rec.get("username"):
+        return rec["username"]
+    return None
+
+
+def _format_uuid(uuid):
+    # Show the dashed UUID form like the example (8-4-4-4-12).
+    if not uuid:
+        return None
+    h = uuid.replace("-", "")
+    if len(h) == 32:
+        return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+    return uuid
+
+
+def build_restriction_embed(member, reason, accounts, offense_num,
+                            moderator=None, auto=False):
+    """accounts: list of (username, uuid) tuples for the account(s) involved."""
     info = RESTRICTIONS.get(reason, {})
-    emoji = info.get("emoji", "⛔")
+    phrase = info.get("phrase", reason)
+    days = info.get("days", 0)
     capped = min(days, DISCORD_MAX_TIMEOUT_DAYS)
 
+    # Clean account list (skip empties, de-dup, keep order).
+    clean = []
+    seen = set()
+    for name, uuid in accounts or []:
+        key = (name or "", uuid or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        if name or uuid:
+            clean.append((name or "unknown", uuid))
+
+    # --- Header line, mirroring the example:
+    #   @user / @user — name1 / name2 — Restricted for <phrase>
+    mention = member.mention
+    mentions = " / ".join([mention] * max(1, len(clean)))
+    names = " / ".join(f"**{n}**" for n, _ in clean) if clean else "**unknown**"
+    header = f"{mentions} — {names}\nRestricted for **{phrase}**"
+
+    # --- Account lines: `name` — `uuid`
+    lines = []
+    for name, uuid in clean:
+        u = _format_uuid(uuid)
+        if u:
+            lines.append(f"`{name}` — `{u}`")
+        else:
+            lines.append(f"`{name}`")
+
+    desc = header
+    if lines:
+        desc += "\n\n" + "\n".join(lines)
+
     embed = discord.Embed(
-        title=f"{emoji} Player Restricted — {reason}",
+        description=desc,
         color=0xED4245,
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="Member", value=member_mention, inline=True)
-    embed.add_field(name="Offense", value=f"**{ordinal(offense_num)} Offense**", inline=True)
-    embed.add_field(name="Duration", value=f"**{days} Days**", inline=True)
 
-    mc_line = f"`{mc_username}`" if mc_username and mc_username != "Unknown" else "*unknown*"
-    if mc_uuid:
-        mc_line += f"\n`{mc_uuid}`"
-    embed.add_field(name="Minecraft Account", value=mc_line, inline=False)
-
+    footer_bits = [f"{days} Days", f"{ordinal(offense_num)} Offense"]
     if auto:
-        embed.add_field(
-            name="Detection",
-            value="Automatically flagged — tested on a different Minecraft account.",
-            inline=False,
-        )
+        footer_bits.append("Auto-detected")
     if moderator is not None:
-        embed.set_footer(text=f"Restricted by {moderator.display_name}")
-    if days > capped:
-        embed.add_field(
-            name="Note",
-            value=f"Discord timeouts max out at {capped} days; the role stays for the full {days}.",
-            inline=False,
-        )
-    return embed
+        footer_bits.append(f"By {moderator.display_name}")
+    embed.set_footer(text="  •  ".join(footer_bits))
+    return embed, (days > capped)
 
 
-async def apply_restriction(guild, member, reason, mc_username=None, mc_uuid=None,
+async def apply_restriction(guild, member, reason, accounts=None,
                             moderator=None, auto=False):
-    """Time the member out, give them the restriction role, announce it, and
-    track the restriction so the role can be removed when it expires.
+    """Time the member out, give them the restriction role, announce it (matching
+    the punishment-message style), and track it for automatic removal on expiry.
+    accounts: list of (username, uuid) tuples involved (one for most; two for
+    alting - the old account and the new one).
     Returns (ok: bool, detail: str)."""
     info = RESTRICTIONS.get(reason)
     if info is None:
@@ -239,7 +282,6 @@ async def apply_restriction(guild, member, reason, mc_username=None, mc_uuid=Non
     gs = get_guild_state(guild.id)
     uid = str(member.id)
 
-    # Offense count for this reason.
     user_off = gs["offenses"].setdefault(uid, {})
     user_off[reason] = int(user_off.get(reason, 0)) + 1
     offense_num = user_off[reason]
@@ -254,9 +296,7 @@ async def apply_restriction(guild, member, reason, mc_username=None, mc_uuid=Non
     try:
         until_dt = datetime.now(timezone.utc) + timedelta(days=capped_days)
         await member.timeout(until_dt, reason=f"{reason} restriction")
-    except discord.Forbidden:
-        timeout_failed = True
-    except discord.HTTPException:
+    except (discord.Forbidden, discord.HTTPException):
         timeout_failed = True
 
     # 2) Restriction role.
@@ -282,8 +322,8 @@ async def apply_restriction(guild, member, reason, mc_username=None, mc_uuid=Non
     # 4) Announce in the punishment channel.
     channel = guild.get_channel(PUNISHMENT_CHANNEL_ID)
     if channel is not None:
-        embed = build_restriction_embed(
-            member.mention, reason, mc_username, mc_uuid, days, offense_num,
+        embed, _capped = build_restriction_embed(
+            member, reason, accounts or [], offense_num,
             moderator=moderator, auto=auto,
         )
         try:
@@ -619,7 +659,7 @@ class JoinModal(discord.ui.Modal, title="Join the Test Queue"):
     )
     server = discord.ui.TextInput(
         label="Preferred Server",
-        placeholder="e.g. PVPclub",
+        placeholder="e.g. PVPClub",
         required=True,
         max_length=40,
     )
@@ -764,9 +804,13 @@ class CloseModal(discord.ui.Modal, title="Submit Test Result"):
             accounts = gs["user_accounts"].setdefault(str(player_id), [])
             prior_other = [u for u in accounts if u and u != mc_uuid]
             if prior_other and target_member is not None:
+                # Show every account involved: the prior one(s) they alted from,
+                # plus the account used in this test.
+                accounts = [(uuid_to_name(puid), puid) for puid in prior_other]
+                accounts.append((mc, mc_uuid))
                 ok, detail = await apply_restriction(
                     interaction.guild, target_member, "Alting",
-                    mc_username=mc, mc_uuid=mc_uuid, auto=True,
+                    accounts=accounts, auto=True,
                 )
                 alt_note = (" ⚠️ This user was tested on a different account before — "
                             "auto-restricted for **Alting** (30 days).")
@@ -1388,7 +1432,8 @@ async def restrict_cmd(interaction: discord.Interaction, user: discord.Member,
 
     ok, detail = await apply_restriction(
         interaction.guild, user, reason_value,
-        mc_username=mc_name, mc_uuid=mc_uuid, moderator=interaction.user, auto=False,
+        accounts=[(mc_name, mc_uuid)] if (mc_name or mc_uuid) else None,
+        moderator=interaction.user, auto=False,
     )
 
     days = info.get("days", "?")
