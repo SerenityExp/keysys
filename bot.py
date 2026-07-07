@@ -1460,4 +1460,24 @@ if __name__ == "__main__":
         )
     if not GUILD_ID:
         print("WARNING: GUILD_ID is 0 — falling back to global command sync (can take up to 1 hour).")
-    bot.run(TOKEN)
+
+    try:
+        bot.run(TOKEN)
+    except discord.HTTPException as e:
+        # 429 = Discord is temporarily blocking logins because the bot tried to
+        # connect too many times (Render restarting the process in a loop). If we
+        # exit immediately, Render restarts us right away and we hit the block
+        # again, keeping it alive forever. Sleeping first spaces the attempts out
+        # so the block can clear.
+        if getattr(e, "status", None) == 429:
+            wait_s = 900  # 15 minutes
+            print(
+                f"Discord is rate-limiting logins (429 Too Many Requests). This happens when the "
+                f"bot restarts too often. Waiting {wait_s // 60} minutes before exiting so the "
+                f"limit can clear — do NOT keep redeploying, that resets the timer."
+            )
+            try:
+                time.sleep(wait_s)
+            except KeyboardInterrupt:
+                pass
+        raise
