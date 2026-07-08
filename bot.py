@@ -887,18 +887,12 @@ class TicketView(discord.ui.View):
 # --------------------------------- Bot -----------------------------------
 class TierBot(commands.Bot):
     async def setup_hook(self):
+        # Keep this FAST and network-light. Registering persistent views is fine.
+        # Command syncing is heavily rate-limited and must NOT happen here — if it
+        # blocks (rate limited), the bot never connects to the gateway and stays
+        # offline. We sync in the background after on_ready instead.
         self.add_view(JoinQueueView())
         self.add_view(TicketView())
-        if GUILD_ID:
-            guild = discord.Object(id=GUILD_ID)
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            # Remove any stale GLOBAL commands left from an earlier run when GUILD_ID
-            # was not set. That leftover global copy is what shows each command twice.
-            self.tree.clear_commands(guild=None)
-            await self.tree.sync()
-        else:
-            await self.tree.sync()
 
 
 intents = discord.Intents.default()
@@ -984,6 +978,31 @@ async def on_ready():
     if not _restriction_sweeper_started:
         _restriction_sweeper_started = True
         bot.loop.create_task(restriction_sweeper_loop())
+    # Sync slash commands in the background (NOT during startup) so a rate-limited
+    # sync can't keep the bot offline. Runs once.
+    global _commands_synced
+    if not _commands_synced:
+        _commands_synced = True
+        bot.loop.create_task(sync_commands_bg())
+
+
+_commands_synced = False
+
+
+async def sync_commands_bg():
+    try:
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
+            print("Slash commands synced to guild (instant).")
+        else:
+            await bot.tree.sync()
+            print("Slash commands synced globally (can take up to 1 hour).")
+    except discord.HTTPException as e:
+        print(f"Command sync skipped ({e}). Existing commands still work; will retry next restart.")
+    except Exception as e:
+        print(f"Command sync error: {e}")
 
 
 _restriction_sweeper_started = False
