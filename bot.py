@@ -718,11 +718,17 @@ class JoinModal(discord.ui.Modal, title="Join the Test Queue"):
             "joined": int(time.time()),
         })
         save_state()
-        await refresh_queue_message(interaction.guild)
+        # Respond to the interaction FIRST (Discord allows only ~3s), THEN do the
+        # slower queue-message refresh. Otherwise on a slow host the refresh eats
+        # the time budget and the user sees "Interaction failed".
         await interaction.response.send_message(
             f"✅ You joined the queue as **{self.mc}** (position {len(gs['queue'])}).",
             ephemeral=True,
         )
+        try:
+            await refresh_queue_message(interaction.guild)
+        except Exception:
+            pass
 
 
 class JoinQueueView(discord.ui.View):
