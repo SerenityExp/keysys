@@ -38,11 +38,21 @@ Tier API:
 
 import os
 import re
+import sys
 import time
 import json
 import asyncio
 import threading
 from datetime import datetime, timedelta, timezone
+
+# Render (and most hosts) buffer Python stdout, which hides log lines like
+# "Logged in as..." until the buffer flushes. Force line-buffering so logs show
+# up in real time and we can actually see what the bot is doing.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 import aiohttp
 from aiohttp import web
@@ -896,7 +906,13 @@ class TierBot(commands.Bot):
 
 
 intents = discord.Intents.default()
-intents.members = True
+# NOTE: we intentionally do NOT enable the privileged "members" or "message
+# content" intents. Requesting a privileged intent that isn't toggled on in the
+# Discord Developer Portal makes Discord refuse the gateway connection — the bot
+# logs in but never comes online. The bot uses fetch_member() where it needs
+# member data, so it works without the members intent. If you DO enable "Server
+# Members Intent" in the portal, you can add `intents.members = True` back for
+# slightly faster member lookups, but it is not required.
 
 bot = TierBot(command_prefix="!", intents=intents)
 tree = bot.tree
