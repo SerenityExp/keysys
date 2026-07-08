@@ -41,6 +41,7 @@ import re
 import time
 import json
 import asyncio
+import threading
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -547,6 +548,24 @@ async def start_api():
     return runner
 
 
+def run_api_server():
+    """Run the tier API in its OWN thread + event loop.
+
+    Render is a web service and needs a port bound quickly, or it marks the
+    deploy failed and restarts (which then re-attempts the Discord login and can
+    trip Discord's rate limit). Binding the port here — before and independent of
+    the Discord connection — means Render always sees an open port, and the mod's
+    API keeps working even if Discord is temporarily unreachable.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(start_api())
+        loop.run_forever()
+    except Exception as e:
+        print(f"API server thread error: {e}")
+
+
 def next_channel_number(category, prefix) -> int:
     nums = [0]
     if category is not None:
@@ -864,10 +883,6 @@ class TierBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(JoinQueueView())
         self.add_view(TicketView())
-        try:
-            await start_api()
-        except Exception as e:
-            print(f"WARNING: tier API failed to start ({e}). The bot will still run.")
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
             self.tree.copy_global_to(guild=guild)
@@ -1461,20 +1476,24 @@ if __name__ == "__main__":
     if not GUILD_ID:
         print("WARNING: GUILD_ID is 0 — falling back to global command sync (can take up to 1 hour).")
 
+    # 1) Bind the port IMMEDIATELY in a background thread so Render always detects
+    #    an open port, no matter what Discord does. This is what stops the
+    #    restart -> re-login -> 429 loop.
+    threading.Thread(target=run_api_server, daemon=True, name="tier-api").start()
+    time.sleep(1)  # give the API a moment to bind before Discord work begins
+
+    # 2) Connect to Discord. If Discord is rate-limiting logins (429), wait a
+    #    good while before exiting so the block can clear and we don't hammer the
+    #    login endpoint. The API thread stays up the whole time.
     try:
         bot.run(TOKEN)
     except discord.HTTPException as e:
-        # 429 = Discord is temporarily blocking logins because the bot tried to
-        # connect too many times (Render restarting the process in a loop). If we
-        # exit immediately, Render restarts us right away and we hit the block
-        # again, keeping it alive forever. Sleeping first spaces the attempts out
-        # so the block can clear.
         if getattr(e, "status", None) == 429:
             wait_s = 900  # 15 minutes
             print(
-                f"Discord is rate-limiting logins (429 Too Many Requests). This happens when the "
-                f"bot restarts too often. Waiting {wait_s // 60} minutes before exiting so the "
-                f"limit can clear — do NOT keep redeploying, that resets the timer."
+                f"Discord is rate-limiting logins (429 Too Many Requests). The tier API is still "
+                f"running. Waiting {wait_s // 60} minutes before exiting so the limit can clear — "
+                f"do NOT keep redeploying, each attempt resets Discord's timer."
             )
             try:
                 time.sleep(wait_s)
