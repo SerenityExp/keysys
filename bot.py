@@ -170,6 +170,7 @@ def get_guild_state(guild_id):
     g.setdefault("tickets", {})             # {channel_id: {player_id, mc, server, kind, provisional}}
     g.setdefault("cooldowns", {})           # {user_id: unix timestamp of last completed test}
     g.setdefault("user_accounts", {})       # {user_id: [mc uuids they've been tested on]}
+    g.setdefault("last_username", {})        # {user_id: last Minecraft username tested}
     g.setdefault("offenses", {})            # {user_id: {reason: count}}
     g.setdefault("active_restrictions", []) # [{user_id, role_id, until, reason}]
     return g
@@ -797,6 +798,8 @@ class CloseModal(discord.ui.Modal, title="Submit Test Result"):
         gs["last_test"] = int(time.time())
         if ticket and ticket.get("player_id") is not None:
             gs["cooldowns"][str(ticket["player_id"])] = int(time.time())
+            if mc and mc != "Unknown":
+                gs["last_username"][str(ticket["player_id"])] = mc
         gs["tickets"].pop(str(interaction.channel.id), None)
         save_state()
 
@@ -863,6 +866,101 @@ class CloseModal(discord.ui.Modal, title="Submit Test Result"):
             await interaction.channel.delete(reason="Tier test closed")
         except discord.HTTPException:
             pass
+
+
+def find_last_username_fast(gs, user_id):
+    """Instant (no network) lookup of a member's most recent tested username.
+    1) explicit last_username record, else 2) newest account in user_accounts
+    resolved to a name via the players store. Returns None if unknown."""
+    uid = str(user_id)
+    lu = gs.get("last_username", {}).get(uid)
+    if lu:
+        return lu
+    accts = gs.get("user_accounts", {}).get(uid, [])
+    if accts:
+        rec = state.get("players", {}).get(accts[-1])
+        if rec and rec.get("username"):
+            return rec["username"]
+    return None
+
+
+class ForceTierModal(discord.ui.Modal, title="Force Tier Result"):
+    earned = discord.ui.TextInput(
+        label="Rank Earned",
+        placeholder="e.g. LT5, HT3",
+        required=True,
+        max_length=20,
+    )
+    previous = discord.ui.TextInput(
+        label="Previous Rank",
+        default="Unranked",
+        required=True,
+        max_length=20,
+    )
+
+    def __init__(self, target_user, mc):
+        super().__init__()
+        self.target_user = target_user
+        self.mc = mc
+
+    async def on_submit(self, interaction: discord.Interaction):
+        gs = get_guild_state(interaction.guild_id)
+        mc = self.mc
+        target_member = self.target_user
+        player_mention = target_member.mention
+
+        # Post the results embed exactly like a normal test close.
+        results_channel = interaction.guild.get_channel(RESULTS_CHANNEL_ID)
+        if results_channel is not None:
+            embed = build_results_embed(
+                interaction.user, player_mention, mc, REGION, str(self.previous), str(self.earned)
+            )
+            try:
+                await results_channel.send(embed=embed)
+            except discord.HTTPException:
+                pass
+
+        # Cooldown + last-username bookkeeping, same as a real test.
+        gs["last_test"] = int(time.time())
+        gs["cooldowns"][str(target_member.id)] = int(time.time())
+        gs["last_username"][str(target_member.id)] = mc
+        save_state()
+
+        # Assign the tier role.
+        role_note = ""
+        role, status = await assign_tier_role(interaction.guild, target_member, str(self.earned))
+        if status == "ok":
+            role_note = f" {role.mention} role given."
+        elif status == "no_role":
+            role_note = f" (No role named **{normalize_rank_code(str(self.earned))}** found — assign it manually.)"
+        elif status == "forbidden":
+            role_note = " (Couldn't assign the role — check my permissions and role order.)"
+        else:
+            role_note = " (Role assignment failed.)"
+
+        # Record the tier to the API.
+        mc_uuid = None
+        if mc and mc != "Unknown":
+            try:
+                rec = await record_player_tier(mc, str(self.earned), REGION)
+                mc_uuid = (rec or {}).get("uuid")
+            except Exception:
+                pass
+
+        # Track the account for future alting detection, but do NOT auto-restrict
+        # here — this is a manual owner action, so a forced tier shouldn't trip an
+        # alting ban on its own.
+        if mc_uuid:
+            accounts = gs["user_accounts"].setdefault(str(target_member.id), [])
+            if mc_uuid not in accounts:
+                accounts.append(mc_uuid)
+            save_state()
+
+        await interaction.response.send_message(
+            f"✅ Forced **{expand_tier(str(self.earned))}** for {player_mention} (`{mc}`).{role_note} "
+            f"Posted to results and recorded to the tier API.",
+            ephemeral=True,
+        )
 
 
 class TicketView(discord.ui.View):
@@ -1505,6 +1603,35 @@ async def restrict_cmd(interaction: discord.Interaction, user: discord.Member,
             f"but: {detail}. Check my role order and that I have Moderate Members + Manage Roles.",
             ephemeral=True,
         )
+
+
+@tree.command(name="forcetier", description="Force a tier result for a member (owner only) — like closing a ticket, via command.")
+@app_commands.default_permissions()
+@app_commands.describe(
+    user="The member to force-tier.",
+    username="Optional: their Minecraft username. If left blank, uses their last tested account.",
+)
+async def forcetier_cmd(interaction: discord.Interaction, user: discord.Member, username: str = None):
+    if not guild_only(interaction):
+        await interaction.response.send_message("Use this in the server.", ephemeral=True)
+        return
+    if not member_is_owner(interaction.user):
+        await interaction.response.send_message("Only the **owner** role can use this.", ephemeral=True)
+        return
+
+    gs = get_guild_state(interaction.guild_id)
+    mc = username or find_last_username_fast(gs, user.id)
+    if not mc:
+        await interaction.response.send_message(
+            f"I don't have a previous test on record for {user.mention}, so I can't auto-fill their "
+            f"username. Re-run `/forcetier` and fill in the **username** option manually.",
+            ephemeral=True,
+        )
+        return
+
+    # send_modal must be the first response and within ~3s. The lookup above is
+    # instant (no network), so opening the modal here is safe.
+    await interaction.response.send_modal(ForceTierModal(target_user=user, mc=mc))
 
 
 # --------------------------------- Run -----------------------------------
