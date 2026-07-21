@@ -216,6 +216,27 @@ def uuid_to_name(uuid):
     return None
 
 
+def other_accounts_for_user(gs, user_id, current_uuid):
+    """ALT TYPE 1 — one Discord account, several Minecraft accounts.
+    Returns the other MC uuids this Discord user has been tested on."""
+    accts = gs.get("user_accounts", {}).get(str(user_id), [])
+    return [u for u in accts if u and u != current_uuid]
+
+
+def other_users_for_account(gs, uuid, current_user_id):
+    """ALT TYPE 2 — one Minecraft account, several Discord accounts.
+    Returns the other Discord user ids that have been tested on this MC uuid."""
+    if not uuid:
+        return []
+    out = []
+    for uid, accts in gs.get("user_accounts", {}).items():
+        if uid == str(current_user_id):
+            continue
+        if uuid in (accts or []):
+            out.append(uid)
+    return out
+
+
 def _format_uuid(uuid):
     # Show the dashed UUID form like the example (8-4-4-4-12).
     if not uuid:
@@ -227,7 +248,7 @@ def _format_uuid(uuid):
 
 
 def build_restriction_embed(member, reason, accounts, offense_num,
-                            moderator=None, auto=False):
+                            moderator=None, auto=False, note=None):
     """accounts: list of (username, uuid) tuples for the account(s) involved."""
     info = RESTRICTIONS.get(reason, {})
     phrase = info.get("phrase", reason)
@@ -264,6 +285,8 @@ def build_restriction_embed(member, reason, accounts, offense_num,
     desc = header
     if lines:
         desc += "\n\n" + "\n".join(lines)
+    if note:
+        desc += f"\n\n-# {note}"
 
     embed = discord.Embed(
         description=desc,
@@ -281,7 +304,7 @@ def build_restriction_embed(member, reason, accounts, offense_num,
 
 
 async def apply_restriction(guild, member, reason, accounts=None,
-                            moderator=None, auto=False):
+                            moderator=None, auto=False, note=None):
     """Time the member out, give them the restriction role, announce it (matching
     the punishment-message style), and track it for automatic removal on expiry.
     accounts: list of (username, uuid) tuples involved (one for most; two for
@@ -336,7 +359,7 @@ async def apply_restriction(guild, member, reason, accounts=None,
     if channel is not None:
         embed, _capped = build_restriction_embed(
             member, reason, accounts or [], offense_num,
-            moderator=moderator, auto=auto,
+            moderator=moderator, auto=auto, note=note,
         )
         try:
             await channel.send(content="@here", embed=embed,
@@ -490,6 +513,62 @@ def parse_tier_text(text):
     if m:
         return ("HT" if m.group(1).lower() == "high" else "LT") + m.group(2)
     return None
+
+
+def parse_result_participants(embed):
+    """From a results embed, pull out (discord_user_id, minecraft_username).
+    Used to detect alting from the #results channel itself, which is permanent —
+    unlike data.json, which the host wipes on restart."""
+    uid = None
+    mc = None
+    for f in embed.fields:
+        name = (f.name or "").lower().replace(":", "").strip()
+        val = (f.value or "").strip()
+        if uid is None and "player" in name:
+            m = re.search(r"<@!?(\d+)>", val)
+            if m:
+                uid = m.group(1)
+        if mc is None and ("username" in name or name == "ign" or "minecraft" in name):
+            mc = val
+    if mc is None and embed.title:
+        m = re.match(r"(.+?)'s Test Results", embed.title)
+        if m:
+            mc = m.group(1).strip()
+    return uid, mc
+
+
+async def scan_results_for_alting(guild, user_id, mc_username, limit=500):
+    """Scan #results for prior tests that overlap with this one.
+
+    Returns (other_usernames, other_user_ids):
+      other_usernames  - other MC accounts this Discord user was tested on
+      other_user_ids   - other Discord users tested on this MC account
+    """
+    channel = guild.get_channel(RESULTS_CHANNEL_ID)
+    if channel is None:
+        return [], []
+    uid_s = str(user_id)
+    mc_low = (mc_username or "").strip().lower()
+    other_usernames = []
+    other_user_ids = []
+    try:
+        async for message in channel.history(limit=limit):
+            for embed in message.embeds:
+                puid, pmc = parse_result_participants(embed)
+                if not pmc:
+                    continue
+                pmc_low = pmc.strip().lower()
+                # Same Discord user, different Minecraft account.
+                if puid and puid == uid_s and pmc_low != mc_low:
+                    if pmc not in other_usernames:
+                        other_usernames.append(pmc)
+                # Same Minecraft account, different Discord user.
+                if pmc_low == mc_low and puid and puid != uid_s:
+                    if puid not in other_user_ids:
+                        other_user_ids.append(puid)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    return other_usernames, other_user_ids
 
 
 def parse_result_embed(embed):
@@ -783,12 +862,31 @@ class CloseModal(discord.ui.Modal, title="Submit Test Result"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Acknowledge immediately. Everything below (Mojang lookup, role changes,
+        # scanning #results for alting) can take longer than Discord's ~3 second
+        # interaction budget, so we defer and reply with a followup at the end.
+        try:
+            await interaction.response.defer()
+        except discord.HTTPException:
+            pass
+
         gs = get_guild_state(interaction.guild_id)
         ticket = gs["tickets"].get(str(interaction.channel.id))
         mc = ticket["mc"] if ticket else "Unknown"
 
         results_channel = interaction.guild.get_channel(RESULTS_CHANNEL_ID)
         player_mention = f"<@{ticket['player_id']}>" if ticket and ticket.get("player_id") is not None else "Unknown"
+        player_id_early = ticket["player_id"] if ticket and ticket.get("player_id") is not None else None
+
+        # Scan #results BEFORE posting this test's result, so we only find
+        # genuinely prior tests. This is the authoritative check — the results
+        # channel is permanent, while saved state is wiped on host restarts.
+        res_other_names, res_other_users = [], []
+        if player_id_early is not None and mc and mc != "Unknown":
+            res_other_names, res_other_users = await scan_results_for_alting(
+                interaction.guild, player_id_early, mc
+            )
+
         if results_channel is not None:
             embed = build_results_embed(
                 interaction.user, player_mention, mc, REGION, str(self.previous), str(self.earned)
@@ -834,33 +932,68 @@ class CloseModal(discord.ui.Modal, title="Submit Test Result"):
             except Exception:
                 rec = None
 
-        # --- Alting detection -------------------------------------------------
-        # If this Discord user has previously been tested on a DIFFERENT
-        # Minecraft account, auto-restrict them for alting.
+        # --- Alting detection (BOTH directions) --------------------------------
+        # Type 1: this Discord user tested on a DIFFERENT Minecraft account.
+        # Type 2: this Minecraft account tested by a DIFFERENT Discord user.
+        # Evidence comes from two places: saved state (fast) and the #results
+        # channel (permanent, survives host restarts). Either one triggers.
         alt_note = ""
-        if player_id is not None and mc_uuid:
-            accounts = gs["user_accounts"].setdefault(str(player_id), [])
-            prior_other = [u for u in accounts if u and u != mc_uuid]
-            if prior_other and target_member is not None:
-                # Show every account involved: the prior one(s) they alted from,
-                # plus the account used in this test.
-                accounts = [(uuid_to_name(puid), puid) for puid in prior_other]
-                accounts.append((mc, mc_uuid))
-                ok, detail = await apply_restriction(
+        if player_id is not None:
+            # NOTE: keep this under its own name. An earlier version reused
+            # `accounts` for both the stored uuid list and the display list, so
+            # the new uuid got appended to the wrong list and was never saved.
+            stored = gs["user_accounts"].setdefault(str(player_id), [])
+
+            prior_uuids = other_accounts_for_user(gs, player_id, mc_uuid) if mc_uuid else []
+            state_other_users = other_users_for_account(gs, mc_uuid, player_id) if mc_uuid else []
+
+            # Combine state evidence with the results-channel evidence.
+            other_users = list(dict.fromkeys(state_other_users + res_other_users))
+            prior_names = list(res_other_names)
+            for u in prior_uuids:
+                n = uuid_to_name(u)
+                if n and n not in prior_names:
+                    prior_names.append(n)
+
+            if (prior_names or other_users) and target_member is not None:
+                # Build the account list for the announcement. Attach uuids where
+                # we know them (local lookup only — no extra network calls).
+                display_accounts = []
+                for n in prior_names:
+                    rec = lookup_player(n)
+                    display_accounts.append((n, (rec or {}).get("uuid")))
+                display_accounts.append((mc, mc_uuid))
+
+                if prior_names and other_users:
+                    note = ("Multiple Minecraft accounts on this Discord, and this Minecraft "
+                            "account was also tested on "
+                            + ", ".join(f"<@{u}>" for u in other_users))
+                elif prior_names:
+                    note = "This Discord account has been tested on more than one Minecraft account."
+                else:
+                    note = ("This Minecraft account has already been tested on "
+                            + ", ".join(f"<@{u}>" for u in other_users))
+
+                await apply_restriction(
                     interaction.guild, target_member, "Alting",
-                    accounts=accounts, auto=True,
+                    accounts=display_accounts, auto=True, note=note,
                 )
-                alt_note = (" ⚠️ This user was tested on a different account before — "
-                            "auto-restricted for **Alting** (30 days).")
-            if mc_uuid not in accounts:
-                accounts.append(mc_uuid)
+                alt_note = " ⚠️ Alting detected — auto-restricted for **Alting** (30 days)."
+
+            # Always record this account against this Discord user so future
+            # tests are detectable in both directions.
+            if mc_uuid and mc_uuid not in stored:
+                stored.append(mc_uuid)
             save_state()
         # ----------------------------------------------------------------------
 
-        await interaction.response.send_message(
-            f"✅ Result submitted: **{expand_tier(str(self.earned))}**.{role_note}{alt_note} "
-            f"Closing this channel in {CLOSE_DELAY} seconds…"
-        )
+        try:
+            await interaction.followup.send(
+                f"✅ Result submitted: **{expand_tier(str(self.earned))}**.{role_note}{alt_note} "
+                f"Closing this channel in {CLOSE_DELAY} seconds…"
+            )
+        except discord.HTTPException:
+            pass
         await asyncio.sleep(CLOSE_DELAY)
         try:
             await interaction.channel.delete(reason="Tier test closed")
